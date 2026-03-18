@@ -1,10 +1,9 @@
-# app.py – Ultimate Crypto Scanner (with strategy toggles and pair count)
+# app.py – Ultimate Crypto Scanner (self‑contained, no pandas_ta)
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 import ccxt
-import pandas_ta as ta
 from datetime import datetime, timedelta
 import time
 import logging
@@ -132,60 +131,104 @@ def fetch_ohlcv(exchange, symbol, timeframe='15m', limit=200):
         logger.error(f"Error fetching {symbol}: {e}")
         return None
 
-# ---------- Indicator Calculator ----------
+# ---------- Manual Indicator Functions ----------
+def compute_rsi(series, period=14):
+    delta = series.diff()
+    gain = delta.where(delta > 0, 0).rolling(period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(period).mean()
+    rs = gain / loss
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
+def compute_macd(series, fast=12, slow=26, signal=9):
+    ema_fast = series.ewm(span=fast, adjust=False).mean()
+    ema_slow = series.ewm(span=slow, adjust=False).mean()
+    macd = ema_fast - ema_slow
+    macd_signal = macd.ewm(span=signal, adjust=False).mean()
+    macd_hist = macd - macd_signal
+    return macd, macd_signal, macd_hist
+
+def compute_bollinger(series, period=20, std=2):
+    sma = series.rolling(period).mean()
+    bb_std = series.rolling(period).std()
+    upper = sma + std * bb_std
+    lower = sma - std * bb_std
+    return upper, sma, lower
+
+def compute_stoch(high, low, close, k=14, d=3):
+    low_k = low.rolling(k).min()
+    high_k = high.rolling(k).max()
+    stoch_k = 100 * (close - low_k) / (high_k - low_k)
+    stoch_d = stoch_k.rolling(d).mean()
+    return stoch_k, stoch_d
+
+def compute_adx(high, low, close, period=14):
+    # Simplified ADX (not exact but sufficient for trend strength)
+    tr = pd.concat([high - low,
+                    (high - close.shift()).abs(),
+                    (low - close.shift()).abs()], axis=1).max(axis=1)
+    atr = tr.rolling(period).mean()
+    plus_dm = high.diff()
+    minus_dm = low.diff()
+    plus_dm[plus_dm < 0] = 0
+    minus_dm[minus_dm > 0] = 0
+    plus_di = 100 * (plus_dm.ewm(alpha=1/period).mean() / atr)
+    minus_di = 100 * (minus_dm.abs().ewm(alpha=1/period).mean() / atr)
+    dx = (abs(plus_di - minus_di) / (plus_di + minus_di)) * 100
+    adx = dx.rolling(period).mean()
+    return adx
+
+def compute_atr(high, low, close, period=14):
+    tr = pd.concat([high - low,
+                    (high - close.shift()).abs(),
+                    (low - close.shift()).abs()], axis=1).max(axis=1)
+    atr = tr.rolling(period).mean()
+    return atr
+
+# ---------- Indicator Calculator (using manual functions) ----------
 class IndicatorCalculator:
     @staticmethod
     def compute(df):
         if df is None or len(df) < 50:
             return df
-        # Basic
-        df['sma_20'] = ta.sma(df['close'], length=20)
-        df['sma_50'] = ta.sma(df['close'], length=50)
-        df['ema_9'] = ta.ema(df['close'], length=9)
-        df['ema_21'] = ta.ema(df['close'], length=21)
-        df['ema_200'] = ta.ema(df['close'], length=200)
+
+        # Basic moving averages
+        df['sma_20'] = df['close'].rolling(20).mean()
+        df['sma_50'] = df['close'].rolling(50).mean()
+        df['ema_9'] = df['close'].ewm(span=9, adjust=False).mean()
+        df['ema_21'] = df['close'].ewm(span=21, adjust=False).mean()
+        df['ema_200'] = df['close'].ewm(span=200, adjust=False).mean()
 
         # RSI
-        df['rsi'] = ta.rsi(df['close'], length=14)
+        df['rsi'] = compute_rsi(df['close'], 14)
 
         # MACD
-        macd = ta.macd(df['close'])
-        if macd is not None:
-            df['macd'] = macd['MACD_12_26_9']
-            df['macd_signal'] = macd['MACDs_12_26_9']
-            df['macd_hist'] = macd['MACDh_12_26_9']
+        macd, macd_signal, macd_hist = compute_macd(df['close'])
+        df['macd'] = macd
+        df['macd_signal'] = macd_signal
+        df['macd_hist'] = macd_hist
 
         # Bollinger Bands
-        bb = ta.bbands(df['close'], length=20, std=2)
-        if bb is not None:
-            df['bb_upper'] = bb['BBU_20_2.0']
-            df['bb_mid'] = bb['BBM_20_2.0']
-            df['bb_lower'] = bb['BBL_20_2.0']
-            df['bb_width'] = (df['bb_upper'] - df['bb_lower']) / df['bb_mid']
+        bb_upper, bb_mid, bb_lower = compute_bollinger(df['close'])
+        df['bb_upper'] = bb_upper
+        df['bb_mid'] = bb_mid
+        df['bb_lower'] = bb_lower
+        df['bb_width'] = (bb_upper - bb_lower) / bb_mid
 
         # Stochastic
-        stoch = ta.stoch(df['high'], df['low'], df['close'])
-        if stoch is not None:
-            df['stoch_k'] = stoch['STOCHk_14_3_3']
-            df['stoch_d'] = stoch['STOCHd_14_3_3']
+        stoch_k, stoch_d = compute_stoch(df['high'], df['low'], df['close'])
+        df['stoch_k'] = stoch_k
+        df['stoch_d'] = stoch_d
 
         # ATR
-        df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=14)
+        df['atr'] = compute_atr(df['high'], df['low'], df['close'], 14)
 
         # Volume
         df['volume_sma'] = df['volume'].rolling(20).mean()
         df['volume_ratio'] = df['volume'] / df['volume_sma']
 
-        # ADX
-        adx = ta.adx(df['high'], df['low'], df['close'])
-        if adx is not None:
-            df['adx'] = adx['ADX_14']
-
-        # SuperTrend (simplified)
-        supertrend = ta.supertrend(df['high'], df['low'], df['close'], length=10, multiplier=3)
-        if supertrend is not None and 'SUPERTd_10_3.0' in supertrend.columns:
-            df['supertrend'] = supertrend['SUPERT_10_3.0']
-            df['supertrend_dir'] = supertrend['SUPERTd_10_3.0']
+        # ADX (optional, not used heavily but included)
+        df['adx'] = compute_adx(df['high'], df['low'], df['close'])
 
         # Swing highs/lows
         df['high_20'] = df['high'].rolling(20).max()
